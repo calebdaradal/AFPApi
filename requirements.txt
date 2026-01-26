@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+pydantic-settings
+loguru
+slowapi
+pyjwt
+pyotp
+qrcode[pil]
+python-jose[cryptography]
