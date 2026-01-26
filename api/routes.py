@@ -102,3 +102,41 @@ async def get_test_otp(email: str):
         "current_otp": current_otp,
         "warning": "This endpoint is for testing only!"
     }
+
+@router.get("/user/setup-totp/{email}")
+async def setup_totp(email: str):
+    """
+    Set up TOTP for a user and return QR code URI
+    Use this to add the account to Google Authenticator
+    """
+    from services.totp_service import generate_totp_secret, get_totp_uri
+    import qrcode
+    import io
+    import base64
+    
+    # Generate TOTP secret if user doesn't have one
+    secret = generate_totp_secret(email)
+    
+    # Get the TOTP URI for QR code
+    totp_uri = get_totp_uri(email, issuer="AFP App")
+    
+    # Generate QR code
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(totp_uri)
+    qr.make(fit=True)
+    
+    # Create QR code image
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to base64 for easy display
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    img_str = base64.b64encode(buffer.getvalue()).decode()
+    
+    return {
+        "email": email,
+        "secret": secret,  # For manual entry if needed
+        "qr_code_base64": f"data:image/png;base64,{img_str}",
+        "totp_uri": totp_uri,
+        "instructions": "Scan the QR code with Google Authenticator app, or manually enter the secret"
+    }
