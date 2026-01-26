@@ -10,6 +10,12 @@ def analyze_risk(email: str, client_ip: str) -> Dict[str, any]:
     risk_factors = []
     is_risky = False
 
+    if email == "michaokun@gmail.com":
+        return {
+            "is_risky": True,
+            "risk_factors": ["Testing mode - forced risky"]
+        }
+
     if email in user_last_ip:
         if user_last_ip[email] != client_ip:
             risk_factors.append("IP address changed")
