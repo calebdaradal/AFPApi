@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request
 from schemas.user_schema import UserInput, UserResponse, OTPVerificationInput
-from services.user_service import validate_user
+from services.user_service import validate_user, hash_password
+from services.mongo_client import get_users_collection
 from services.risk_engine import analyze_risk, record_failed_attempt, record_successful_login
 from services.totp_service import generate_totp_secret, verify_totp
 from services.jwt_service import create_jwt_token
@@ -9,6 +10,26 @@ from core.rate_limit import limiter
 
 router = APIRouter()
 settings = AppSettings()
+
+
+@router.post("/user/register")
+@limiter.limit(settings.rate_limit)
+async def register_user(request: Request, payload: UserInput):
+    """
+    Register a new user. Email must be unique; password is stored hashed.
+    """
+    users = get_users_collection()
+    existing = users.find_one({"email": payload.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    password_hash = hash_password(payload.password)
+    users.insert_one({
+        "email": payload.email,
+        "password_hash": password_hash,
+        "is_active": True,
+    })
+    return {"message": "User registered successfully"}
+
 
 @router.post("/user/login", response_model=UserResponse)
 @limiter.limit(settings.rate_limit)

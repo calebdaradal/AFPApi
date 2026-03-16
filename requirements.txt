@@ -8,3 +8,6 @@ pyjwt
 pyotp
 qrcode[pil]
 python-jose[cryptography]
+pymongo
+python-dotenv
+bcrypt
