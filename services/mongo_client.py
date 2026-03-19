@@ -19,3 +19,13 @@ def get_db():
 def get_users_collection():
     """Return the users collection for auth (email, password_hash)."""
     return _db["users"]
+
+
+def get_customers_collection():
+    """Return the customers collection for customer records."""
+    return _db["customers"]
+
+
+def get_records_collection():
+    """Return the records collection for IN/OUT scan logs."""
+    return _db["records"]

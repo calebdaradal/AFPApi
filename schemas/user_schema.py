@@ -28,6 +28,22 @@ class UserProfileUpdateInput(BaseModel):
     last_name: str = Field(..., description="Updated last name")
     phone_number: str = Field(..., description="Updated phone number")
 
+class CustomerCreateInput(BaseModel):
+    first_name: str = Field(..., description="Customer first name")
+    last_name: str = Field(..., description="Customer last name")
+    address: str = Field(..., description="Customer address")
+    age: int = Field(..., description="Customer age")
+    car_model: str = Field(..., description="Customer car model")
+    car_make: str = Field(..., description="Customer car make")
+    plate_number: str = Field(..., description="Customer plate number")
+    active: bool = Field(..., description="Whether customer is active")
+    vehicle_color: str = Field(..., description="Customer vehicle color")
+    image: str = Field(..., description="Customer image URL or base64 string")
+
+class RecordCreateInput(BaseModel):
+    customer_id: str = Field(..., description="MongoDB customer _id as string")
+    type: str = Field(..., description='Scan type: "IN" or "OUT"')
+
 class BaseResponse(BaseModel):
     message: str
     status_code: int = Field(..., description="The status code of the response")
