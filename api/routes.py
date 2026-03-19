@@ -29,6 +29,19 @@ router = APIRouter()
 settings = AppSettings()
 
 
+def _to_json_safe(value):
+    """
+    Recursively convert Mongo/BSON values (like ObjectId) into JSON-safe values.
+    """
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_json_safe(item) for item in value]
+    return value
+
+
 def _decrypt_qr_customer_id(qr_payload: str) -> str:
     """
     Decrypt QR payload format "<iv_b64>.<ciphertext_b64>" using AES-256-GCM.
@@ -319,7 +332,7 @@ async def create_record(
     records = get_records_collection()
     result = records.insert_one(record_data)
 
-    return {
+    response_payload = {
         "message": "Record created successfully",
         "record_id": str(result.inserted_id),
         "record": record_data,
@@ -337,6 +350,7 @@ async def create_record(
             "image": customer.get("image", ""),
         },
     }
+    return _to_json_safe(response_payload)
 
 
 @router.get("/user/test-otp/{email}")
