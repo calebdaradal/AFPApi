@@ -20,10 +20,17 @@ from schemas.user_schema import (
 from services.user_service import validate_user, hash_password
 from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection
 from services.risk_engine import analyze_risk, record_failed_attempt, record_successful_login
-from services.totp_service import verify_totp, get_or_create_totp_secret
+from services.totp_service import (
+    verify_totp,
+    get_or_create_totp_secret,
+    canonical_email_for_user,
+    get_totp_secret,
+    totp_provisioning_uri,
+)
 from services.jwt_service import create_jwt_token, verify_jwt_token
 from core.config import AppSettings
 from core.rate_limit import limiter
+from loguru import logger
 
 router = APIRouter()
 settings = AppSettings()
@@ -156,7 +163,7 @@ async def login_user(request: Request, payload: LoginInput):
     risk_analysis = analyze_risk(payload.email, client_ip)
 
     # Ensure user has a persisted TOTP secret (same secret as /user/setup-totp QR when enrolled once).
-    get_or_create_totp_secret(payload.email)
+    get_or_create_totp_secret(payload.email.strip())
 
     # Do not issue JWT or record success until /user/verify-otp succeeds
     return UserResponse(
@@ -172,23 +179,23 @@ async def verify_otp(request: Request, payload: OTPVerificationInput):
     """
     Verify OTP code and issue JWT token
     """
-    # Get client IP
+    # Match trimmed/cased email to Mongo user + totp_secret
     client_ip = request.client.host if request.client else "unknown"
-    
-    # Verify OTP code
-    if not verify_totp(payload.email, payload.otp_code):
+    email_in = payload.email.strip()
+
+    if not verify_totp(email_in, payload.otp_code):
+        has_secret = get_totp_secret(email_in) is not None
+        logger.warning("OTP verification failed (has_stored_totp_secret={})", has_secret)
         raise HTTPException(status_code=401, detail="Invalid OTP code")
-    
-    # OTP verified successfully
-    # Record successful login
-    record_successful_login(payload.email, client_ip)
-    # Generate and return JWT token
-    token = create_jwt_token(payload.email)
+
+    canonical = canonical_email_for_user(email_in) or email_in
+    record_successful_login(canonical, client_ip)
+    token = create_jwt_token(canonical)
     return UserResponse(
         message="OTP verified successfully",
         status_code=200,
         token=token,
-        requires_otp=False
+        requires_otp=False,
     )
 
 
@@ -369,18 +376,19 @@ async def setup_totp(email: str):
     Return a QR / URI for Google Authenticator.
     Reuses the existing stored secret when present so reopening this URL does not invalidate the app.
     """
-    from services.totp_service import get_or_create_totp_secret, totp_provisioning_uri
     import qrcode
     import io
     import base64
 
+    email_in = email.strip()
     try:
-        secret = get_or_create_totp_secret(email)
+        secret = get_or_create_totp_secret(email_in)
     except ValueError:
         raise HTTPException(status_code=404, detail="User not found")
 
-    totp_uri = totp_provisioning_uri(secret, email, issuer="AFP App")
-    
+    canon = canonical_email_for_user(email_in) or email_in
+    totp_uri = totp_provisioning_uri(secret, canon, issuer="AFP App")
+
     # Generate QR code
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
     qr.add_data(totp_uri)
@@ -393,11 +401,11 @@ async def setup_totp(email: str):
     buffer = io.BytesIO()
     img.save(buffer, format='PNG')
     img_str = base64.b64encode(buffer.getvalue()).decode()
-    
+
     return {
-        "email": email,
+        "email": canon,
         "secret": secret,  # For manual entry if needed
         "qr_code_base64": f"data:image/png;base64,{img_str}",
         "totp_uri": totp_uri,
-        "instructions": "Scan the QR code with Google Authenticator app, or manually enter the secret"
+        "instructions": "Scan the QR code with Google Authenticator app, or manually enter the secret",
     }
