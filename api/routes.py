@@ -141,45 +141,31 @@ async def register_user(request: Request, payload: RegisterInput):
 @limiter.limit(settings.rate_limit)
 async def login_user(request: Request, payload: LoginInput):
     """
-    Login endpoint with risk analysis
-    Returns 200 with JWT if no risk, 202 if risky (requires OTP)
+    Login endpoint: valid password always requires OTP before a JWT is issued.
     """
-    # Get client IP address for risk analysis
+    # Get client IP address for risk analysis (still logged via factors below).
     client_ip = request.client.host if request.client else "unknown"
-    
+
     # Validate user credentials first
     if not validate_user(payload.email, payload.password):
         # Record failed attempt for risk analysis
         record_failed_attempt(payload.email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    # Run risk analysis
+
+    # Risk context for clients that want to show why extra care may apply
     risk_analysis = analyze_risk(payload.email, client_ip)
-    
-    # If no risk, issue JWT token directly
-    if not risk_analysis["is_risky"]:
-        # Record successful login
-        record_successful_login(payload.email, client_ip)
-        # Generate JWT token
-        token = create_jwt_token(payload.email)
-        return UserResponse(
-            message="Login successful",
-            status_code=200,
-            token=token,
-            requires_otp=False
-        )
-    
-    # If risky, require OTP verification
-    # Generate TOTP secret if user doesn't have one
+
+    # Ensure TOTP exists so OTP step always works after first login
     from services.totp_service import get_totp_secret
     if not get_totp_secret(payload.email):
         generate_totp_secret(payload.email)
-    
+
+    # Do not issue JWT or record success until /user/verify-otp succeeds
     return UserResponse(
         message="OTP verification required",
         status_code=202,
         requires_otp=True,
-        risk_factors=risk_analysis["risk_factors"]
+        risk_factors=risk_analysis["risk_factors"],
     )
 
 @router.post("/user/verify-otp", response_model=UserResponse)
@@ -348,6 +334,8 @@ async def create_record(
             "active": customer.get("active", False),
             "vehicle_color": customer.get("vehicle_color", ""),
             "image": customer.get("image", ""),
+            # Second image URL from MongoDB field imageId (or snake_case image_id)
+            "image_id": customer.get("imageId") or customer.get("image_id", ""),
         },
     }
     return _to_json_safe(response_payload)
