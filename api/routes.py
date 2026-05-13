@@ -20,7 +20,7 @@ from schemas.user_schema import (
 from services.user_service import validate_user, hash_password
 from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection
 from services.risk_engine import analyze_risk, record_failed_attempt, record_successful_login
-from services.totp_service import generate_totp_secret, verify_totp
+from services.totp_service import verify_totp, get_or_create_totp_secret
 from services.jwt_service import create_jwt_token, verify_jwt_token
 from core.config import AppSettings
 from core.rate_limit import limiter
@@ -155,10 +155,8 @@ async def login_user(request: Request, payload: LoginInput):
     # Risk context for clients that want to show why extra care may apply
     risk_analysis = analyze_risk(payload.email, client_ip)
 
-    # Ensure TOTP exists so OTP step always works after first login
-    from services.totp_service import get_totp_secret
-    if not get_totp_secret(payload.email):
-        generate_totp_secret(payload.email)
+    # Ensure user has a persisted TOTP secret (same secret as /user/setup-totp QR when enrolled once).
+    get_or_create_totp_secret(payload.email)
 
     # Do not issue JWT or record success until /user/verify-otp succeeds
     return UserResponse(
@@ -368,19 +366,20 @@ async def get_test_otp(email: str):
 @router.get("/user/setup-totp/{email}")
 async def setup_totp(email: str):
     """
-    Set up TOTP for a user and return QR code URI
-    Use this to add the account to Google Authenticator
+    Return a QR / URI for Google Authenticator.
+    Reuses the existing stored secret when present so reopening this URL does not invalidate the app.
     """
-    from services.totp_service import generate_totp_secret, get_totp_uri
+    from services.totp_service import get_or_create_totp_secret, totp_provisioning_uri
     import qrcode
     import io
     import base64
-    
-    # Generate TOTP secret if user doesn't have one
-    secret = generate_totp_secret(email)
-    
-    # Get the TOTP URI for QR code
-    totp_uri = get_totp_uri(email, issuer="AFP App")
+
+    try:
+        secret = get_or_create_totp_secret(email)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    totp_uri = totp_provisioning_uri(secret, email, issuer="AFP App")
     
     # Generate QR code
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
