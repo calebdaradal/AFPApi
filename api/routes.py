@@ -140,6 +140,7 @@ async def register_user(request: Request, payload: RegisterInput):
         "last_name": payload.last_name,
         "phone_number": payload.phone_number,
         "is_active": True,
+        "image": (payload.image or "").strip(),
     })
     return {"message": "User registered successfully"}
 
@@ -210,12 +211,15 @@ async def get_user_profile(request: Request, authorization: Optional[str] = Head
     user = users.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    raw_img = user.get("image", "")
+    profile_image = raw_img.strip() if isinstance(raw_img, str) else ""
     return UserProfileResponse(
         email=user.get("email", ""),
         first_name=user.get("first_name", ""),
         last_name=user.get("last_name", ""),
         phone_number=user.get("phone_number", ""),
         is_active=user.get("is_active", False),
+        image=profile_image,
     )
 
 
@@ -241,6 +245,7 @@ async def update_user_profile(
                 "first_name": payload.first_name,
                 "last_name": payload.last_name,
                 "phone_number": payload.phone_number,
+                "image": (payload.image or "").strip(),
             }
         },
     )
