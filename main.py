@@ -19,6 +19,12 @@ setup_logging(settings.debug)
 # Create FastAPI app
 app = FastAPI(title=settings.app_name)
 
+
+@app.get("/health")
+async def health():
+    """Liveness probe: returns 200 when the API process is up."""
+    return {"status": "ok"}
+
 # Configure CORS middleware - allows cross-origin requests from Flutter app
 app.add_middleware(
     CORSMiddleware,

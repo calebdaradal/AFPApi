@@ -336,6 +336,8 @@ async def create_record(
             "image": customer.get("image", ""),
             # Second image URL from MongoDB field imageId (or snake_case image_id)
             "image_id": customer.get("imageId") or customer.get("image_id", ""),
+            # Third image: person photo from MongoDB imagePerson (or snake_case image_person)
+            "image_person": customer.get("imagePerson") or customer.get("image_person", ""),
         },
     }
     return _to_json_safe(response_payload)
