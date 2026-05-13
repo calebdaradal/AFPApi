@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Request, Header
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta, timezone
 import base64
 import binascii
+import hashlib
 from urllib.parse import quote
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -20,7 +21,12 @@ from schemas.user_schema import (
 )
 from services.user_service import validate_user, hash_password
 from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection
-from services.risk_engine import analyze_risk, record_failed_attempt, record_successful_login
+from services.risk_engine import (
+    analyze_risk,
+    record_failed_attempt,
+    record_successful_login,
+    otp_periodic_reverify_is_required,
+)
 from services.totp_service import (
     verify_totp,
     get_or_create_totp_secret,
@@ -157,6 +163,50 @@ def _get_email_from_authorization(authorization: Optional[str]) -> str:
         raise HTTPException(status_code=401, detail=str(exc))
 
 
+def _parse_last_totp_verified_at(raw) -> Optional[datetime]:
+    """Parse Mongo `last_totp_verified_at` ISO string to timezone-aware UTC datetime."""
+    if not raw:
+        return None
+    try:
+        s = str(raw).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(s)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
+
+
+def _auth_email_and_require_fresh_totp_if_enabled(
+    authorization: Optional[str],
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Validate JWT and load user. If OTP is on and last TOTP success is older than policy,
+    reject so the client clears the session and re-logs in with OTP.
+    """
+    email = _get_email_from_authorization(authorization)
+    users = get_users_collection()
+    user = users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    now_utc = datetime.now(timezone.utc)
+    last_dt = _parse_last_totp_verified_at(user.get("last_totp_verified_at"))
+    reverify, _ = otp_periodic_reverify_is_required(
+        bool(user.get("otp_enabled", False)),
+        last_dt,
+        now_utc,
+    )
+    if reverify:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "OTP_REVERIFY_REQUIRED",
+                "message": "Authenticator must be re-verified at least every 7 days. Please log in again.",
+            },
+        )
+    return email, user
+
+
 @router.post("/user/register")
 @limiter.limit(settings.rate_limit)
 async def register_user(request: Request, payload: RegisterInput):
@@ -187,7 +237,7 @@ async def register_user(request: Request, payload: RegisterInput):
 async def login_user(request: Request, payload: LoginInput):
     """
     If OTP is disabled for the user: password-only login (JWT issued).
-    If OTP enabled: use risk_engine — non-risky → JWT; risky → OTP required first.
+    If OTP enabled: use risk_engine plus 7-day TOTP re-verify — non-risky and fresh → JWT; else OTP required first.
     """
     client_ip = request.client.host if request.client else "unknown"
     if not validate_user(payload.email, payload.password):
@@ -218,7 +268,19 @@ async def login_user(request: Request, payload: LoginInput):
             show_otp_setup_prompt=show_prompt,
         )
 
-    if not risk_analysis["is_risky"]:
+    now_utc = datetime.now(timezone.utc)
+    last_dt = _parse_last_totp_verified_at(user.get("last_totp_verified_at"))
+    reverify_needed, reverify_msg = otp_periodic_reverify_is_required(
+        True,
+        last_dt,
+        now_utc,
+    )
+    risk_factors = list(risk_analysis["risk_factors"])
+    if reverify_needed and reverify_msg:
+        risk_factors.append(reverify_msg)
+
+    needs_otp = risk_analysis["is_risky"] or reverify_needed
+    if not needs_otp:
         record_successful_login(canon, client_ip)
         token = create_jwt_token(canon)
         return UserResponse(
@@ -226,7 +288,7 @@ async def login_user(request: Request, payload: LoginInput):
             status_code=200,
             token=token,
             requires_otp=False,
-            risk_factors=risk_analysis["risk_factors"],
+            risk_factors=risk_factors,
             show_otp_setup_prompt=False,
         )
 
@@ -236,7 +298,7 @@ async def login_user(request: Request, payload: LoginInput):
         status_code=202,
         token=None,
         requires_otp=True,
-        risk_factors=risk_analysis["risk_factors"],
+        risk_factors=risk_factors,
         show_otp_setup_prompt=False,
     )
 
@@ -256,6 +318,11 @@ async def verify_otp(request: Request, payload: OTPVerificationInput):
         raise HTTPException(status_code=401, detail="Invalid OTP code")
 
     canonical = canonical_email_for_user(email_in) or email_in
+    users = get_users_collection()
+    users.update_one(
+        {"email": canonical},
+        {"$set": {"last_totp_verified_at": datetime.now(timezone.utc).isoformat()}},
+    )
     record_successful_login(canonical, client_ip)
     token = create_jwt_token(canonical)
     return UserResponse(
@@ -275,7 +342,7 @@ async def otp_setup_prompt_response(
     authorization: Optional[str] = Header(default=None),
 ):
     """After login: user accepts or declines optional OTP enrollment (requires JWT)."""
-    email = _get_email_from_authorization(authorization)
+    email, _ = _auth_email_and_require_fresh_totp_if_enabled(authorization)
     users = get_users_collection()
     now_iso = datetime.now(timezone.utc).isoformat()
     if payload.accepted:
@@ -302,11 +369,7 @@ async def get_user_profile(request: Request, authorization: Optional[str] = Head
     """
     Get authenticated user's profile from MongoDB.
     """
-    email = _get_email_from_authorization(authorization)
-    users = get_users_collection()
-    user = users.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    _, user = _auth_email_and_require_fresh_totp_if_enabled(authorization)
     raw_img = user.get("image", "")
     profile_image = raw_img.strip() if isinstance(raw_img, str) else ""
     return UserProfileResponse(
@@ -330,11 +393,8 @@ async def update_user_profile(
     """
     Update authenticated user's profile fields.
     """
-    email = _get_email_from_authorization(authorization)
+    email, user = _auth_email_and_require_fresh_totp_if_enabled(authorization)
     users = get_users_collection()
-    user = users.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
     set_doc = {
         "first_name": payload.first_name,
         "last_name": payload.last_name,
@@ -404,7 +464,7 @@ async def create_record(
     """
     Create an IN/OUT record from a scanned customer QR code.
     """
-    _get_email_from_authorization(authorization)
+    _auth_email_and_require_fresh_totp_if_enabled(authorization)
     scan_type = payload.type.strip().upper()
     if scan_type not in {"IN", "OUT"}:
         raise HTTPException(status_code=400, detail='Invalid type. Use "IN" or "OUT".')

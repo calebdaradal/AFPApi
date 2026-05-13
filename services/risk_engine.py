@@ -1,6 +1,9 @@
-from datetime import datetime, timedelta
-from typing import Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple
 from collections import defaultdict
+
+# When authenticator (TOTP) is enabled, require a successful OTP at least this often.
+OTP_REVERIFY_DAYS = 7
 
 user_last_ip: Dict[str, str] = {}
 
@@ -54,3 +57,25 @@ def record_successful_login(email: str, client_ip: str):
     user_last_ip[email] = client_ip
     if email in failed_attempts:
         failed_attempts[email].clear()
+
+
+def otp_periodic_reverify_is_required(
+    otp_enabled: bool,
+    last_totp_verified_at: Optional[datetime],
+    now: datetime,
+) -> Tuple[bool, str]:
+    """
+    Extra risk factor for OTP users: require TOTP again after OTP_REVERIFY_DAYS
+    since the last successful /user/verify-otp (or if never verified).
+    """
+    if not otp_enabled:
+        return False, ""
+    if last_totp_verified_at is None:
+        return True, "Authenticator verification required (first time or 7-day policy)"
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if last_totp_verified_at.tzinfo is None:
+        last_totp_verified_at = last_totp_verified_at.replace(tzinfo=timezone.utc)
+    if now - last_totp_verified_at > timedelta(days=OTP_REVERIFY_DAYS):
+        return True, "Authenticator re-verification required (7 days since last OTP)"
+    return False, ""
