@@ -30,6 +30,10 @@ class UserProfileResponse(BaseModel):
         default="",
         description="Profile image URL or data URI; empty means use app default asset",
     )
+    otp_enabled: bool = Field(
+        default=False,
+        description="When true, risky logins require TOTP; when false, password-only login",
+    )
 
 class UserProfileUpdateInput(BaseModel):
     first_name: str = Field(..., description="Updated first name")
@@ -38,6 +42,10 @@ class UserProfileUpdateInput(BaseModel):
     image: str = Field(
         default="",
         description="Profile image URL or data URI; empty clears to default placeholder",
+    )
+    otp_enabled: Optional[bool] = Field(
+        default=None,
+        description="If set, updates whether TOTP is used on risky logins",
     )
 
 class CustomerCreateInput(BaseModel):
@@ -64,3 +72,14 @@ class UserResponse(BaseResponse):
     token: Optional[str] = Field(None, description="JWT token if login successful")
     requires_otp: Optional[bool] = Field(None, description="True if OTP verification required")
     risk_factors: Optional[List[str]] = Field(None, description="List of risk factors detected")
+    show_otp_setup_prompt: bool = Field(
+        default=False,
+        description="True when client should offer optional OTP enrollment",
+    )
+
+
+class OtpSetupPromptInput(BaseModel):
+    accepted: bool = Field(
+        ...,
+        description="True: enable OTP and prepare TOTP secret; false: dismiss and schedule next nudge",
+    )

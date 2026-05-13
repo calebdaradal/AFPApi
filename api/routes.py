@@ -1,9 +1,9 @@
 from fastapi import APIRouter, HTTPException, Request, Header
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import base64
 import binascii
-import hashlib
+from urllib.parse import quote
 from bson import ObjectId
 from bson.errors import InvalidId
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -16,6 +16,7 @@ from schemas.user_schema import (
     UserProfileUpdateInput,
     CustomerCreateInput,
     RecordCreateInput,
+    OtpSetupPromptInput,
 )
 from services.user_service import validate_user, hash_password
 from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection
@@ -34,6 +35,40 @@ from loguru import logger
 
 router = APIRouter()
 settings = AppSettings()
+
+_OTP_NUDGE_DAYS = 30
+
+
+def _maybe_refresh_periodic_otp_prompt(users, email_canon: str) -> None:
+    """If OTP is off and user dismissed setup, re-prompt after [_OTP_NUDGE_DAYS]."""
+    user = users.find_one({"email": email_canon})
+    if not user or user.get("otp_enabled"):
+        return
+    if user.get("otp_setup_prompt_pending"):
+        return
+    last = user.get("otp_last_nudge_at")
+    now = datetime.now(timezone.utc)
+    due = False
+    if not last:
+        due = True
+    else:
+        try:
+            s = str(last).replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(s)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if now - parsed > timedelta(days=_OTP_NUDGE_DAYS):
+                due = True
+        except Exception:
+            due = True
+    if due:
+        users.update_one({"email": email_canon}, {"$set": {"otp_setup_prompt_pending": True}})
+
+
+def _show_otp_setup_prompt(user: dict) -> bool:
+    if user.get("otp_enabled"):
+        return False
+    return bool(user.get("otp_setup_prompt_pending"))
 
 
 def _to_json_safe(value):
@@ -141,6 +176,8 @@ async def register_user(request: Request, payload: RegisterInput):
         "phone_number": payload.phone_number,
         "is_active": True,
         "image": (payload.image or "").strip(),
+        "otp_enabled": False,
+        "otp_setup_prompt_pending": True,
     })
     return {"message": "User registered successfully"}
 
@@ -149,29 +186,58 @@ async def register_user(request: Request, payload: RegisterInput):
 @limiter.limit(settings.rate_limit)
 async def login_user(request: Request, payload: LoginInput):
     """
-    Login endpoint: valid password always requires OTP before a JWT is issued.
+    If OTP is disabled for the user: password-only login (JWT issued).
+    If OTP enabled: use risk_engine — non-risky → JWT; risky → OTP required first.
     """
-    # Get client IP address for risk analysis (still logged via factors below).
     client_ip = request.client.host if request.client else "unknown"
-
-    # Validate user credentials first
     if not validate_user(payload.email, payload.password):
-        # Record failed attempt for risk analysis
         record_failed_attempt(payload.email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Risk context for clients that want to show why extra care may apply
-    risk_analysis = analyze_risk(payload.email, client_ip)
+    users = get_users_collection()
+    email_stripped = payload.email.strip()
+    canon = canonical_email_for_user(email_stripped) or email_stripped
+    user = users.find_one({"email": canon})
+    if not user:
+        raise HTTPException(status_code=500, detail="User record not found")
 
-    # Ensure user has a persisted TOTP secret (same secret as /user/setup-totp QR when enrolled once).
-    get_or_create_totp_secret(payload.email.strip())
+    _maybe_refresh_periodic_otp_prompt(users, canon)
+    user = users.find_one({"email": canon}) or user
+    show_prompt = _show_otp_setup_prompt(user)
+    risk_analysis = analyze_risk(canon, client_ip)
 
-    # Do not issue JWT or record success until /user/verify-otp succeeds
+    if not user.get("otp_enabled", False):
+        record_successful_login(canon, client_ip)
+        token = create_jwt_token(canon)
+        return UserResponse(
+            message="Login successful",
+            status_code=200,
+            token=token,
+            requires_otp=False,
+            risk_factors=risk_analysis["risk_factors"],
+            show_otp_setup_prompt=show_prompt,
+        )
+
+    if not risk_analysis["is_risky"]:
+        record_successful_login(canon, client_ip)
+        token = create_jwt_token(canon)
+        return UserResponse(
+            message="Login successful",
+            status_code=200,
+            token=token,
+            requires_otp=False,
+            risk_factors=risk_analysis["risk_factors"],
+            show_otp_setup_prompt=False,
+        )
+
+    get_or_create_totp_secret(canon)
     return UserResponse(
         message="OTP verification required",
         status_code=202,
+        token=None,
         requires_otp=True,
         risk_factors=risk_analysis["risk_factors"],
+        show_otp_setup_prompt=False,
     )
 
 @router.post("/user/verify-otp", response_model=UserResponse)
@@ -197,7 +263,37 @@ async def verify_otp(request: Request, payload: OTPVerificationInput):
         status_code=200,
         token=token,
         requires_otp=False,
+        show_otp_setup_prompt=False,
     )
+
+
+@router.post("/user/otp-setup-response")
+@limiter.limit(settings.rate_limit)
+async def otp_setup_prompt_response(
+    request: Request,
+    payload: OtpSetupPromptInput,
+    authorization: Optional[str] = Header(default=None),
+):
+    """After login: user accepts or declines optional OTP enrollment (requires JWT)."""
+    email = _get_email_from_authorization(authorization)
+    users = get_users_collection()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if payload.accepted:
+        get_or_create_totp_secret(email)
+        users.update_one(
+            {"email": email},
+            {"$set": {"otp_enabled": True, "otp_setup_prompt_pending": False}},
+        )
+        path = f"user/setup-totp/{quote(email, safe='')}"
+        return {
+            "message": "OTP enabled. Open the URL below in a browser to scan your QR code.",
+            "setup_totp_path": path,
+        }
+    users.update_one(
+        {"email": email},
+        {"$set": {"otp_setup_prompt_pending": False, "otp_last_nudge_at": now_iso}},
+    )
+    return {"message": "Acknowledged", "setup_totp_path": None}
 
 
 @router.get("/user/profile", response_model=UserProfileResponse)
@@ -220,6 +316,7 @@ async def get_user_profile(request: Request, authorization: Optional[str] = Head
         phone_number=user.get("phone_number", ""),
         is_active=user.get("is_active", False),
         image=profile_image,
+        otp_enabled=bool(user.get("otp_enabled", False)),
     )
 
 
@@ -238,16 +335,19 @@ async def update_user_profile(
     user = users.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    set_doc = {
+        "first_name": payload.first_name,
+        "last_name": payload.last_name,
+        "phone_number": payload.phone_number,
+        "image": (payload.image or "").strip(),
+    }
+    if payload.otp_enabled is not None:
+        set_doc["otp_enabled"] = payload.otp_enabled
+        if payload.otp_enabled:
+            get_or_create_totp_secret(email)
     users.update_one(
         {"email": email},
-        {
-            "$set": {
-                "first_name": payload.first_name,
-                "last_name": payload.last_name,
-                "phone_number": payload.phone_number,
-                "image": (payload.image or "").strip(),
-            }
-        },
+        {"$set": set_doc},
     )
     return {"message": "Profile updated successfully"}
 
