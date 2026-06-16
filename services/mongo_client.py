@@ -16,6 +16,11 @@ def get_db():
     return _db
 
 
+def get_database(db_name: str):  # added: allow selecting a specific database by name (e.g., "vpc") for testing endpoints
+    """Return a database instance by name using the shared MongoClient."""  # added: docstring for new helper
+    return _client[db_name]  # added: reuse existing client and select requested database
+
+
 def get_users_collection():
     """Return the users collection for auth (email, password_hash)."""
     return _db["users"]

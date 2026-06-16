@@ -20,7 +20,7 @@ from schemas.user_schema import (
     OtpSetupPromptInput,
 )
 from services.user_service import validate_user, hash_password
-from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection
+from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection, get_database  # added: get_database for test DB dump endpoint
 from services.risk_engine import (
     analyze_risk,
     record_failed_attempt,
@@ -83,6 +83,8 @@ def _to_json_safe(value):
     """
     if isinstance(value, ObjectId):
         return str(value)
+    if isinstance(value, datetime):  # added: ensure datetimes from Mongo can be returned in JSON responses
+        return value.isoformat()  # added: represent datetimes as ISO-8601 strings for JSON safety
     if isinstance(value, dict):
         return {k: _to_json_safe(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -574,3 +576,16 @@ async def setup_totp(email: str):
         "totp_uri": totp_uri,
         "instructions": "Scan the QR code with Google Authenticator app, or manually enter the secret",
     }
+
+
+@router.get("/test/vpc/dump")  # added: testing endpoint to dump all collections/documents from MongoDB database "vpc"
+@limiter.limit(settings.rate_limit)  # added: keep consistent rate limiting for this testing endpoint
+async def dump_vpc_database(request: Request):  # added: handler for returning all data inside the "vpc" database
+    if not settings.debug:  # added: only allow this endpoint when DEBUG is enabled to reduce production exposure risk
+        raise HTTPException(status_code=404, detail="Not found")  # added: hide the endpoint when not in debug mode
+    db = get_database("vpc")  # added: select the requested database explicitly by name
+    collections_data = {}  # added: container for all collection dumps
+    for collection_name in db.list_collection_names():  # added: enumerate all collections in the database
+        docs = list(db[collection_name].find({}))  # added: fetch all documents from the current collection
+        collections_data[collection_name] = _to_json_safe(docs)  # added: convert BSON types to JSON-safe values
+    return {"db": "vpc", "data": collections_data}  # added: return the full database dump payload
