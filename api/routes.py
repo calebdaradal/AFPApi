@@ -533,8 +533,8 @@ async def create_record(
     if not passcard:  # added: not found
         raise HTTPException(status_code=404, detail="Passcard not found")  # added: consistent 404 error
     passcard_status = str(passcard.get("Status") or "").strip().upper()  # added: validate passcard status for scan eligibility
-    if passcard_status not in {"APPROVED", "LOST"}:  # added: only allow scanning approved/lost passcards
-        raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # added: required message for invalid passcard status
+    if passcard_status == "LOST":  # changed: only block LOST passcards from scanning
+        raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # changed: keep same modal-triggering message
 
     owner_id = (passcard.get("OwnerId") or "").strip()  # added: owner id reference from passcard
     vehicle_id = (passcard.get("VehicleId") or "").strip()  # added: default vehicle id reference from passcard
@@ -554,11 +554,13 @@ async def create_record(
         raise HTTPException(status_code=404, detail="Vehicle not found")  # added: consistent 404 error
 
     address_obj = owner.get("Address") if isinstance(owner.get("Address"), dict) else {}  # added: safely read nested address object
+    rank_obj = owner.get("Rank") if isinstance(owner.get("Rank"), dict) else {}  # added: safely read nested rank object
     owner_payload = {  # added: shape owner details needed by Flutter modal
         "id": owner.get("_id", ""),  # added: owner id
         "first_name": owner.get("FirstName", ""),  # added: owner first name
         "middle_name": owner.get("MiddleName", ""),  # added: owner middle name
         "last_name": owner.get("LastName", ""),  # added: owner last name
+        "rank_name": rank_obj.get("Name", ""),  # added: owner rank display name
         "mobile_no": owner.get("MobileNo", ""),  # added: owner mobile number
         "status": owner.get("Status", ""),  # added: owner status (ACTIVE/INACTIVE)
         "address": address_obj.get("Address", ""),  # added: owner address string
@@ -608,11 +610,19 @@ async def create_record(
         "time": now.strftime("%H:%M:%S"),  # added: scan time
     }  # added: end record
 
+    passcard_payload = {  # added: passcard details for owner section labels
+        "id": passcard.get("_id", passcard_id),  # added: passcard id
+        "category": passcard.get("Category", ""),  # added: passcard category
+        "category_eligibility": passcard.get("CategoryEligibility", ""),  # added: passcard category eligibility
+        "category_specification": passcard.get("CategorySpecification", ""),  # added: passcard category specification
+    }  # added: end passcard payload
+
     response_payload = {  # added: response expected by Flutter after scanning
         "message": "Scan successful",  # added: success message
         "record": record_data,  # added: scan metadata
         "owner": owner_payload,  # added: owner details
         "vehicle": vehicle_payload,  # changed: single vehicle tied to the passcard
+        "passcard": passcard_payload,  # added: passcard details for UI labels
         "passcard_status": passcard_status,  # changed: normalized passcard status
     }  # added: end response
     return _to_json_safe(response_payload)  # changed: ensure JSON-safe types
