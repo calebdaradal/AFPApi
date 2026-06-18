@@ -318,7 +318,7 @@ async def login_user(request: Request, payload: LoginInput):
     if reverify_needed and reverify_msg:
         risk_factors.append(reverify_msg)
 
-    needs_otp = risk_analysis["is_risky"] or reverify_needed
+    needs_otp = True
     if not needs_otp:
         record_successful_login(canon, client_ip)
         token = create_jwt_token(canon)
@@ -535,6 +535,28 @@ async def create_record(
     passcard_status = str(passcard.get("Status") or "").strip().upper()  # added: validate passcard status for scan eligibility
     if passcard_status == "LOST":  # changed: only block LOST passcards from scanning
         raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # changed: keep same modal-triggering message
+    expires_in_raw = passcard.get("ExpiresIn")  # added: passcard expiry window in days
+    try:  # added: coerce expires-in into an integer
+        expires_in = int(expires_in_raw) if expires_in_raw is not None and str(expires_in_raw).strip() != "" else 0  # added: default to 0 when missing
+    except Exception:  # added: handle invalid expires-in values
+        expires_in = 0  # added: treat invalid expires-in as no expiry
+    if expires_in < 0:  # added: negative expires-in invalidates passcard immediately
+        raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # added: required invalid modal message
+    if expires_in > 0:  # added: expiry check only when expires-in is positive
+        approved_raw = passcard.get("ApprovedDate")  # added: approved date ISO string
+        approved_str = str(approved_raw or "").strip()  # added: normalize approved date string
+        if not approved_str:  # added: approved date required when expiry is enabled
+            raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # added: required invalid modal message
+        try:  # added: parse ISO datetime with offset (ex: 2026-06-18T05:13:04.506+00:00)
+            approved_dt = datetime.fromisoformat(approved_str)  # added: parse into datetime
+        except Exception:  # added: parsing failed
+            raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # added: required invalid modal message
+        if approved_dt.tzinfo is None:  # added: ensure timezone-aware datetime
+            approved_dt = approved_dt.replace(tzinfo=timezone.utc)  # added: assume UTC when tz is missing
+        expires_at = approved_dt + timedelta(days=expires_in)  # added: compute expiry datetime
+        now_utc = datetime.now(timezone.utc)  # added: current UTC datetime
+        if now_utc > expires_at.astimezone(timezone.utc):  # added: invalid when current date is past expiry date
+            raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # added: required invalid modal message
 
     owner_id = (passcard.get("OwnerId") or "").strip()  # added: owner id reference from passcard
     vehicle_id = (passcard.get("VehicleId") or "").strip()  # added: default vehicle id reference from passcard
@@ -572,16 +594,29 @@ async def create_record(
     vehicle_object_key = resolve_vehicle_object_key(vehicle_file_name)
     raw_documents = passcard.get("Documents") if isinstance(passcard.get("Documents"), list) else passcard.get("documents")  # added: read passcard documents (supports Documents/documents casing)
     documents = raw_documents if isinstance(raw_documents, list) else []  # added: normalize documents to a list
-    d_or_doc = None  # added: holder for the d_or document entry
+    d_owner_doc = None  # added: holder for the d_owner document entry
     for doc in documents:  # added: scan passcard documents list
         if not isinstance(doc, dict):  # added: skip non-object entries
             continue  # added: move to next
         doc_name = str(doc.get("Name") or "").strip().lower()  # added: normalize document Name field
-        if doc_name == "d_or":  # added: match d_or document
-            d_or_doc = doc  # added: store matching document
+        if doc_name == "d_owner":  # changed: match d_owner document (new 2nd image)
+            d_owner_doc = doc  # changed: store matching document
             break  # added: stop searching after first match
-    d_or_file_name = (d_or_doc.get("FileName") or "").strip() if isinstance(d_or_doc, dict) else ""  # added: extract d_or FileName
-    d_or_object_key = resolve_passcard_document_object_key("d_or", d_or_file_name) if d_or_file_name else ""  # added: resolve d_or/{FileName} key if present
+    if d_owner_doc is None:  # added: fallback for older data that still uses d_or
+        for doc in documents:  # added: scan passcard documents list again
+            if not isinstance(doc, dict):  # added: skip non-object entries
+                continue  # added: move to next
+            doc_name = str(doc.get("Name") or "").strip().lower()  # added: normalize document Name field
+            if doc_name == "d_or":  # added: legacy fallback
+                d_owner_doc = doc  # added: reuse variable for legacy d_or
+                break  # added: stop searching after first match
+    d_owner_file_name = (d_owner_doc.get("FileName") or "").strip() if isinstance(d_owner_doc, dict) else ""  # changed: extract d_owner FileName
+    d_owner_folder = "d_owner"  # added: default folder name for second document image
+    if isinstance(d_owner_doc, dict):  # added: infer folder name from document entry when possible
+        name_field = str(d_owner_doc.get("Name") or "").strip().lower()  # added: normalize name field
+        if name_field in {"d_owner", "d_or"}:  # added: restrict to known folders
+            d_owner_folder = name_field  # added: use detected folder
+    d_owner_object_key = resolve_passcard_document_object_key(d_owner_folder, d_owner_file_name) if d_owner_file_name else ""  # changed: resolve {folder}/{FileName} key if present
     vehicle_payload = {  # added: single vehicle payload (each passcard ties to one vehicle)
         "id": vehicle.get("_id", ""),  # added: vehicle id
         "plate_number": vehicle.get("PlateNumber", ""),  # added: plate number
@@ -595,11 +630,12 @@ async def create_record(
         "image_found": bool(vehicle_object_key),
         "image_url": presign_get_object(vehicle_object_key, expires_seconds=300) if vehicle_object_key else "",
         "image_proxy_path": f"vehicle/image/{quote(vehicle_file_name, safe='')}" if vehicle_file_name else "",
-        "d_or_file_name": d_or_file_name,  # added: passcard document file name for d_or
-        "d_or_s3_key": d_or_object_key,  # added: resolved S3 key for d_or document (d_or/{FileName})
-        "d_or_image_found": bool(d_or_object_key),  # added: indicate if d_or image exists in S3
-        "d_or_image_url": presign_get_object(d_or_object_key, expires_seconds=300) if d_or_object_key else "",  # added: presigned URL for d_or image
-        "d_or_image_proxy_path": f"passcard/document/d_or/{quote(d_or_file_name, safe='')}" if d_or_file_name else "",  # added: API proxy path for streaming d_or image
+        "d_owner_file_name": d_owner_file_name,  # changed: passcard document file name for d_owner
+        "d_owner_folder": d_owner_folder,  # added: folder name used for the second document image (d_owner or fallback d_or)
+        "d_owner_s3_key": d_owner_object_key,  # changed: resolved S3 key for d_owner document ({folder}/{FileName})
+        "d_owner_image_found": bool(d_owner_object_key),  # changed: indicate if d_owner image exists in S3
+        "d_owner_image_url": presign_get_object(d_owner_object_key, expires_seconds=300) if d_owner_object_key else "",  # changed: presigned URL for d_owner image
+        "d_owner_image_proxy_path": f"passcard/document/{quote(d_owner_folder, safe='')}/{quote(d_owner_file_name, safe='')}" if d_owner_file_name else "",  # changed: API proxy path for streaming d_owner image
     }  # added: end vehicle payload
 
     now = datetime.now()  # added: scan timestamp (not persisted)
@@ -655,16 +691,16 @@ async def get_vehicle_image(request: Request, filename: str):  # changed: includ
     return StreamingResponse(body, media_type=content_type)
 
 
-@router.get("/passcard/document/{doc_name}/{filename}")  # added: stream passcard document images from S3 (ex: d_or/{FileName})
+@router.get("/passcard/document/{doc_name}/{filename}")  # changed: stream passcard document images from S3 (ex: d_owner/{FileName})
 @limiter.limit(settings.rate_limit)  # added: keep consistent rate limiting
 async def get_passcard_document_image(request: Request, doc_name: str, filename: str):  # added: handler for passcard document image proxy
     folder = (doc_name or "").strip().strip("/").lower()  # added: normalize folder name
-    if folder != "d_or":  # added: restrict to d_or for now (avoid arbitrary key reads)
+    if folder not in {"d_owner", "d_or"}:  # changed: restrict to known passcard document folders (avoid arbitrary key reads)
         raise HTTPException(status_code=404, detail="Image not found")  # added: hide unsupported document folders
     name = (filename or "").strip().lstrip("/")  # added: normalize filename
     if not name:  # added: validate required filename
         raise HTTPException(status_code=400, detail="filename is required")  # added: consistent missing filename error
-    key = resolve_passcard_document_object_key(folder, name)  # added: resolve S3 key under d_or/
+    key = resolve_passcard_document_object_key(folder, name)  # changed: resolve S3 key under allowed folder/
     if not key:  # added: not found
         raise HTTPException(status_code=404, detail="Image not found")  # added: consistent not found error
     client = get_s3_client()  # added: reuse singleton S3 client
