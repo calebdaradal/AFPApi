@@ -521,8 +521,8 @@ async def create_record(
     if not raw_passcard_id:  # added: validate required passcard id
         raise HTTPException(status_code=400, detail="passcard_id is required")  # added: consistent 400 error
     passcard_id = raw_passcard_id  # added: default to raw scan value
-    if raw_passcard_id.lower().startswith("vpc:"):  # added: support new QR format: vpc:{raw passcard id}
-        passcard_id = raw_passcard_id.split(":", 1)[1].strip()  # added: strip prefix and whitespace
+    if raw_passcard_id.lower().startswith("vpccode:"):  # changed: support new QR format: vpccode:{raw passcard id}
+        passcard_id = raw_passcard_id.split(":", 1)[1].strip()  # changed: strip prefix and whitespace
     if not passcard_id:  # added: validate after vpc: stripping
         raise HTTPException(status_code=400, detail="passcard_id is required")  # added: consistent 400 error
 
