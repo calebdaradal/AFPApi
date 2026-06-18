@@ -517,8 +517,13 @@ async def create_record(
     scan_type = payload.type.strip().upper()
     if scan_type not in {"IN", "OUT"}:
         raise HTTPException(status_code=400, detail='Invalid type. Use "IN" or "OUT".')
-    passcard_id = (payload.passcard_id or "").strip()  # added: passcard id from QR
-    if not passcard_id:  # added: validate required passcard id
+    raw_passcard_id = (payload.passcard_id or "").strip()  # added: passcard id from QR
+    if not raw_passcard_id:  # added: validate required passcard id
+        raise HTTPException(status_code=400, detail="passcard_id is required")  # added: consistent 400 error
+    passcard_id = raw_passcard_id  # added: default to raw scan value
+    if raw_passcard_id.lower().startswith("vpc:"):  # added: support new QR format: vpc:{raw passcard id}
+        passcard_id = raw_passcard_id.split(":", 1)[1].strip()  # added: strip prefix and whitespace
+    if not passcard_id:  # added: validate after vpc: stripping
         raise HTTPException(status_code=400, detail="passcard_id is required")  # added: consistent 400 error
 
     passcards = get_passcards_collection()  # added: use passcards collection for lookup
