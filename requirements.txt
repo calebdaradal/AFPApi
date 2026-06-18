@@ -11,3 +11,4 @@ python-jose[cryptography]
 pymongo
 python-dotenv
 bcrypt
+boto3

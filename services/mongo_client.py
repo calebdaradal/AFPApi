@@ -34,3 +34,15 @@ def get_customers_collection():
 def get_records_collection():
     """Return the records collection for IN/OUT scan logs."""
     return _db["records"]
+
+
+def get_passcards_collection():  # added: new MongoDB collection helper for passcards (new VPC schema)
+    return _db["passcards"]  # added: return passcards collection
+
+
+def get_owners_collection():  # added: new MongoDB collection helper for owners (new VPC schema)
+    return _db["owners"]  # added: return owners collection
+
+
+def get_vehicles_collection():  # added: new MongoDB collection helper for vehicles (new VPC schema)
+    return _db["vehicles"]  # added: return vehicles collection

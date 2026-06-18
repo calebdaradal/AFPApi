@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request, Header
+from fastapi.responses import StreamingResponse
 from typing import Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta, timezone
 import base64
@@ -19,8 +20,16 @@ from schemas.user_schema import (
     RecordCreateInput,
     OtpSetupPromptInput,
 )
-from services.user_service import validate_user, hash_password
-from services.mongo_client import get_users_collection, get_customers_collection, get_records_collection, get_database  # added: get_database for test DB dump endpoint
+from services.user_service import validate_user, hash_password, find_user_by_email, get_user_email  # changed: support new Mongo user schema fields (Email/Security)
+from services.mongo_client import (  # changed: include new VPC schema collections
+    get_users_collection,  # unchanged: users collection helper
+    get_customers_collection,  # unchanged: legacy customers helper (not used by new scan flow)
+    get_records_collection,  # unchanged: legacy records helper (not used by new scan flow)
+    get_database,  # unchanged: debug helper
+    get_passcards_collection,  # added: passcards collection helper for new scan flow
+    get_owners_collection,  # added: owners collection helper for new scan flow
+    get_vehicles_collection,  # added: vehicles collection helper for new scan flow
+)  # changed: end import list
 from services.risk_engine import (
     analyze_risk,
     record_failed_attempt,
@@ -34,6 +43,7 @@ from services.totp_service import (
     get_totp_secret,
     totp_provisioning_uri,
 )
+from services.s3_client import resolve_vehicle_object_key, resolve_passcard_document_object_key, presign_get_object, get_s3_client  # changed: add passcard document S3 resolver (d_or/{FileName})
 from services.jwt_service import create_jwt_token, verify_jwt_token
 from core.config import AppSettings
 from core.rate_limit import limiter
@@ -47,7 +57,7 @@ _OTP_NUDGE_DAYS = 30
 
 def _maybe_refresh_periodic_otp_prompt(users, email_canon: str) -> None:
     """If OTP is off and user dismissed setup, re-prompt after [_OTP_NUDGE_DAYS]."""
-    user = users.find_one({"email": email_canon})
+    user = find_user_by_email(users, email_canon)  # changed: support both `email` and `Email` user schemas
     if not user or user.get("otp_enabled"):
         return
     if user.get("otp_setup_prompt_pending"):
@@ -67,8 +77,8 @@ def _maybe_refresh_periodic_otp_prompt(users, email_canon: str) -> None:
                 due = True
         except Exception:
             due = True
-    if due:
-        users.update_one({"email": email_canon}, {"$set": {"otp_setup_prompt_pending": True}})
+    if due:  # changed: keep behavior and update by _id to avoid schema field-name mismatch
+        users.update_one({"_id": user["_id"]}, {"$set": {"otp_setup_prompt_pending": True}})  # changed: update by _id for schema compatibility
 
 
 def _show_otp_setup_prompt(user: dict) -> bool:
@@ -188,9 +198,10 @@ def _auth_email_and_require_fresh_totp_if_enabled(
     """
     email = _get_email_from_authorization(authorization)
     users = get_users_collection()
-    user = users.find_one({"email": email})
+    user = find_user_by_email(users, email)  # changed: support both legacy (`email`) and new (`Email`) schemas
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    email = get_user_email(user) or email  # added: normalize email to stored value for downstream consistency
     now_utc = datetime.now(timezone.utc)
     last_dt = _parse_last_totp_verified_at(user.get("last_totp_verified_at"))
     reverify, _ = otp_periodic_reverify_is_required(
@@ -216,21 +227,34 @@ async def register_user(request: Request, payload: RegisterInput):
     Register a new user. Email must be unique; password is stored hashed.
     """
     users = get_users_collection()
-    existing = users.find_one({"email": payload.email})
+    existing = find_user_by_email(users, payload.email)  # changed: check both `email` and `Email` fields
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     password_hash = hash_password(payload.password)
-    users.insert_one({
-        "email": payload.email,
-        "password_hash": password_hash,
-        "first_name": payload.first_name,
-        "last_name": payload.last_name,
-        "phone_number": payload.phone_number,
-        "is_active": True,
-        "image": (payload.image or "").strip(),
-        "otp_enabled": False,
-        "otp_setup_prompt_pending": True,
-    })
+    users.insert_one({  # changed: insert using new Mongo user schema (and keep app-required fields)
+        "UserName": payload.email.strip(),  # added: new schema field
+        "Email": payload.email.strip(),  # added: new schema field used for login
+        "TenantId": "",  # added: new schema field placeholder
+        "Security": {  # added: new schema security object
+            "Password": password_hash,  # changed: store bcrypt hash under Security.Password
+            "IsVerified": True,  # added: new schema field default
+            "IsActive": True,  # added: new schema field default (used by profile)
+            "Role": "",  # added: new schema field placeholder
+            "ScanOnly": False,  # added: new schema field default
+            "PasswordExpiry": None,  # added: new schema field default
+        },  # added: end Security
+        "FullName": {  # added: new schema name object
+            "LastName": payload.last_name,  # added: new schema field
+            "FirstName": payload.first_name,  # added: new schema field
+            "MiddleName": "",  # added: new schema field placeholder
+        },  # added: end FullName
+        "Implementor": {"Name": ""},  # added: new schema field placeholder
+        "Env": "",  # added: new schema field placeholder
+        "phone_number": payload.phone_number,  # changed: keep app-required field (legacy name)
+        "image": (payload.image or "").strip(),  # changed: keep app-required field
+        "otp_enabled": False,  # unchanged: app feature flag stored at root
+        "otp_setup_prompt_pending": True,  # unchanged: app feature flag stored at root
+    })  # changed: end insert
     return {"message": "User registered successfully"}
 
 
@@ -242,19 +266,32 @@ async def login_user(request: Request, payload: LoginInput):
     If OTP enabled: use risk_engine plus 7-day TOTP re-verify — non-risky and fresh → JWT; else OTP required first.
     """
     client_ip = request.client.host if request.client else "unknown"
+    if settings.debug:  # added: emit detailed login attempt logs only when DEBUG=True
+        logger.info(  # added: log safe login metadata (no password printed)
+            "Login attempt received (email_input={!r}, client_ip={!r})",  # added: include safe context
+            (payload.email or "").strip(),  # added: normalized email only
+            client_ip,  # added: client ip for correlation
+        )  # added: end log call
     if not validate_user(payload.email, payload.password):
         record_failed_attempt(payload.email)
+        if settings.debug:  # added: emit detailed login rejection logs only when DEBUG=True
+            logger.warning(  # added: log rejection without leaking password/hash
+                "Login rejected: invalid credentials (email_input={!r}, client_ip={!r})",  # added: safe context only
+                (payload.email or "").strip(),  # added: normalized email only
+                client_ip,  # added: client ip for correlation
+            )  # added: end log call
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    users = get_users_collection()
-    email_stripped = payload.email.strip()
-    canon = canonical_email_for_user(email_stripped) or email_stripped
-    user = users.find_one({"email": canon})
+    users = get_users_collection()  # unchanged: load users collection
+    email_stripped = payload.email.strip()  # unchanged: normalize input
+    canon = canonical_email_for_user(email_stripped) or email_stripped  # unchanged: resolve stored casing where possible
+    user = find_user_by_email(users, canon)  # changed: support both `email` and `Email` user schemas
     if not user:
         raise HTTPException(status_code=500, detail="User record not found")
+    canon = get_user_email(user) or canon  # added: ensure we use the stored email value for downstream logic
 
     _maybe_refresh_periodic_otp_prompt(users, canon)
-    user = users.find_one({"email": canon}) or user
+    user = users.find_one({"_id": user["_id"]}) or user  # changed: reload by _id after possible update
     show_prompt = _show_otp_setup_prompt(user)
     risk_analysis = analyze_risk(canon, client_ip)
 
@@ -319,12 +356,15 @@ async def verify_otp(request: Request, payload: OTPVerificationInput):
         logger.warning("OTP verification failed (has_stored_totp_secret={})", has_secret)
         raise HTTPException(status_code=401, detail="Invalid OTP code")
 
-    canonical = canonical_email_for_user(email_in) or email_in
-    users = get_users_collection()
-    users.update_one(
-        {"email": canonical},
-        {"$set": {"last_totp_verified_at": datetime.now(timezone.utc).isoformat()}},
-    )
+    canonical = canonical_email_for_user(email_in) or email_in  # unchanged: resolve canonical email
+    users = get_users_collection()  # unchanged: load users collection
+    user = find_user_by_email(users, canonical)  # added: support both `email` and `Email` user schemas
+    if not user:  # added: fail clearly if user is missing
+        raise HTTPException(status_code=404, detail="User not found")  # added: consistent error for missing user
+    users.update_one(  # changed: update by _id for schema compatibility
+        {"_id": user["_id"]},  # changed: update by _id
+        {"$set": {"last_totp_verified_at": datetime.now(timezone.utc).isoformat()}},  # unchanged: store ISO timestamp
+    )  # changed: end update
     record_successful_login(canonical, client_ip)
     token = create_jwt_token(canonical)
     return UserResponse(
@@ -347,10 +387,13 @@ async def otp_setup_prompt_response(
     email, _ = _auth_email_and_require_fresh_totp_if_enabled(authorization)
     users = get_users_collection()
     now_iso = datetime.now(timezone.utc).isoformat()
+    user = find_user_by_email(users, email)  # added: load user for schema-safe updates
+    if not user:  # added: fail clearly if user missing
+        raise HTTPException(status_code=404, detail="User not found")  # added: consistent error for missing user
     if payload.accepted:
         get_or_create_totp_secret(email)
         users.update_one(
-            {"email": email},
+            {"_id": user["_id"]},  # changed: update by _id for schema compatibility
             {"$set": {"otp_enabled": True, "otp_setup_prompt_pending": False}},
         )
         path = f"user/setup-totp/{quote(email, safe='')}"
@@ -358,10 +401,10 @@ async def otp_setup_prompt_response(
             "message": "OTP enabled. Open the URL below in a browser to scan your QR code.",
             "setup_totp_path": path,
         }
-    users.update_one(
-        {"email": email},
-        {"$set": {"otp_setup_prompt_pending": False, "otp_last_nudge_at": now_iso}},
-    )
+    users.update_one(  # changed: update by _id for schema compatibility
+        {"_id": user["_id"]},  # changed: update by _id
+        {"$set": {"otp_setup_prompt_pending": False, "otp_last_nudge_at": now_iso}},  # unchanged: store dismissal and nudge time
+    )  # changed: end update
     return {"message": "Acknowledged", "setup_totp_path": None}
 
 
@@ -371,15 +414,17 @@ async def get_user_profile(request: Request, authorization: Optional[str] = Head
     """
     Get authenticated user's profile from MongoDB.
     """
-    _, user = _auth_email_and_require_fresh_totp_if_enabled(authorization)
-    raw_img = user.get("image", "")
+    _, user = _auth_email_and_require_fresh_totp_if_enabled(authorization)  # unchanged: load authenticated user
+    raw_img = user.get("image", "")  # unchanged: image field (app-specific)
     profile_image = raw_img.strip() if isinstance(raw_img, str) else ""
+    full_name = user.get("FullName") if isinstance(user.get("FullName"), dict) else {}  # added: read new schema name object safely
+    security = user.get("Security") if isinstance(user.get("Security"), dict) else {}  # added: read new schema security object safely
     return UserProfileResponse(
-        email=user.get("email", ""),
-        first_name=user.get("first_name", ""),
-        last_name=user.get("last_name", ""),
-        phone_number=user.get("phone_number", ""),
-        is_active=user.get("is_active", False),
+        email=get_user_email(user),  # changed: support both `email` and `Email` fields
+        first_name=user.get("first_name") or full_name.get("FirstName", ""),  # changed: prefer legacy, fallback to new schema
+        last_name=user.get("last_name") or full_name.get("LastName", ""),  # changed: prefer legacy, fallback to new schema
+        phone_number=user.get("phone_number", ""),  # unchanged: stored at root for app compatibility
+        is_active=bool(user.get("is_active")) if "is_active" in user else bool(security.get("IsActive", False)),  # changed: map active flag from new schema
         image=profile_image,
         otp_enabled=bool(user.get("otp_enabled", False)),
     )
@@ -395,20 +440,22 @@ async def update_user_profile(
     """
     Update authenticated user's profile fields.
     """
-    email, user = _auth_email_and_require_fresh_totp_if_enabled(authorization)
+    email, user = _auth_email_and_require_fresh_totp_if_enabled(authorization)  # unchanged: load authenticated user
     users = get_users_collection()
     set_doc = {
-        "first_name": payload.first_name,
-        "last_name": payload.last_name,
-        "phone_number": payload.phone_number,
-        "image": (payload.image or "").strip(),
+        "first_name": payload.first_name,  # unchanged: keep legacy field for backward compatibility
+        "last_name": payload.last_name,  # unchanged: keep legacy field for backward compatibility
+        "FullName.FirstName": payload.first_name,  # added: update new schema field
+        "FullName.LastName": payload.last_name,  # added: update new schema field
+        "phone_number": payload.phone_number,  # unchanged: app uses this field
+        "image": (payload.image or "").strip(),  # unchanged: app uses this field
     }
     if payload.otp_enabled is not None:
         set_doc["otp_enabled"] = payload.otp_enabled
         if payload.otp_enabled:
             get_or_create_totp_secret(email)
     users.update_one(
-        {"email": email},
+        {"_id": user["_id"]},  # changed: update by _id for schema compatibility
         {"$set": set_doc},
     )
     return {"message": "Profile updated successfully"}
@@ -464,55 +511,163 @@ async def create_record(
     authorization: Optional[str] = Header(default=None),
 ):
     """
-    Create an IN/OUT record from a scanned customer QR code.
-    """
+    Create an IN/OUT scan response from a scanned passcard QR code.
+    """  # changed: passcards are now the scanned IDs (new VPC schema)
     _auth_email_and_require_fresh_totp_if_enabled(authorization)
     scan_type = payload.type.strip().upper()
     if scan_type not in {"IN", "OUT"}:
         raise HTTPException(status_code=400, detail='Invalid type. Use "IN" or "OUT".')
+    passcard_id = (payload.passcard_id or "").strip()  # added: passcard id from QR
+    if not passcard_id:  # added: validate required passcard id
+        raise HTTPException(status_code=400, detail="passcard_id is required")  # added: consistent 400 error
 
-    customer_object_id = _resolve_customer_object_id(payload.customer_id)
+    passcards = get_passcards_collection()  # added: use passcards collection for lookup
+    passcard = passcards.find_one({"_id": passcard_id})  # added: primary lookup by passcard _id
+    if not passcard:  # added: fallback lookup by SerialNumber
+        passcard = passcards.find_one({"SerialNumber": passcard_id})  # added: support scanning serial number if used in QR
+    if not passcard:  # added: not found
+        raise HTTPException(status_code=404, detail="Passcard not found")  # added: consistent 404 error
+    passcard_status = str(passcard.get("Status") or "").strip().upper()  # added: validate passcard status for scan eligibility
+    if passcard_status not in {"APPROVED", "LOST"}:  # added: only allow scanning approved/lost passcards
+        raise HTTPException(status_code=400, detail="Sorry invalid passcard")  # added: required message for invalid passcard status
 
-    customers = get_customers_collection()
-    customer = customers.find_one({"_id": customer_object_id})
-    if not customer:
-        raise HTTPException(status_code=404, detail="Customer not found")
+    owner_id = (passcard.get("OwnerId") or "").strip()  # added: owner id reference from passcard
+    vehicle_id = (passcard.get("VehicleId") or "").strip()  # added: default vehicle id reference from passcard
+    if not owner_id:  # added: validate passcard linkage
+        raise HTTPException(status_code=500, detail="Passcard is missing OwnerId")  # added: data integrity error
 
-    now = datetime.now()
-    record_data = {
-        "customer_id": str(customer["_id"]),
-        "first_name": customer.get("first_name", ""),
-        "last_name": customer.get("last_name", ""),
-        "date": now.strftime("%Y-%m-%d"),
-        "time": now.strftime("%H:%M:%S"),
-        "type": scan_type,
-    }
-    records = get_records_collection()
-    result = records.insert_one(record_data)
+    owners = get_owners_collection()  # added: owners collection for joined details
+    owner = owners.find_one({"_id": owner_id})  # added: load owner by _id
+    if not owner:  # added: owner not found
+        raise HTTPException(status_code=404, detail="Owner not found")  # added: consistent 404 error
 
-    response_payload = {
-        "message": "Record created successfully",
-        "record_id": str(result.inserted_id),
-        "record": record_data,
-        "customer": {
-            "id": str(customer["_id"]),
-            "first_name": customer.get("first_name", ""),
-            "last_name": customer.get("last_name", ""),
-            "address": customer.get("address", ""),
-            "age": customer.get("age", 0),
-            "car_model": customer.get("car_model", ""),
-            "car_make": customer.get("car_make", ""),
-            "plate_number": customer.get("plate_number", ""),
-            "active": customer.get("active", False),
-            "vehicle_color": customer.get("vehicle_color", ""),
-            "image": customer.get("image", ""),
-            # Second image URL from MongoDB field imageId (or snake_case image_id)
-            "image_id": customer.get("imageId") or customer.get("image_id", ""),
-            # Third image: person photo from MongoDB imagePerson (or snake_case image_person)
-            "image_person": customer.get("imagePerson") or customer.get("image_person", ""),
-        },
-    }
-    return _to_json_safe(response_payload)
+    vehicles = get_vehicles_collection()  # added: vehicles collection for joined details
+    if not vehicle_id:  # added: passcard should always tie to one vehicle
+        raise HTTPException(status_code=500, detail="Passcard is missing VehicleId")  # added: data integrity error
+    vehicle = vehicles.find_one({"_id": vehicle_id})  # changed: each passcard maps to one specific vehicle
+    if not vehicle:  # added: vehicle not found
+        raise HTTPException(status_code=404, detail="Vehicle not found")  # added: consistent 404 error
+
+    address_obj = owner.get("Address") if isinstance(owner.get("Address"), dict) else {}  # added: safely read nested address object
+    owner_payload = {  # added: shape owner details needed by Flutter modal
+        "id": owner.get("_id", ""),  # added: owner id
+        "first_name": owner.get("FirstName", ""),  # added: owner first name
+        "middle_name": owner.get("MiddleName", ""),  # added: owner middle name
+        "last_name": owner.get("LastName", ""),  # added: owner last name
+        "mobile_no": owner.get("MobileNo", ""),  # added: owner mobile number
+        "status": owner.get("Status", ""),  # added: owner status (ACTIVE/INACTIVE)
+        "address": address_obj.get("Address", ""),  # added: owner address string
+        "brgy_id": address_obj.get("BrgyId", ""),  # added: owner brgy id
+    }  # added: end owner payload
+
+    wheel_obj = vehicle.get("WheelType") if isinstance(vehicle.get("WheelType"), dict) else {}  # added: safely read nested wheel type object
+    vehicle_file_name = (vehicle.get("FileName") or "").strip()
+    vehicle_object_key = resolve_vehicle_object_key(vehicle_file_name)
+    raw_documents = passcard.get("Documents") if isinstance(passcard.get("Documents"), list) else passcard.get("documents")  # added: read passcard documents (supports Documents/documents casing)
+    documents = raw_documents if isinstance(raw_documents, list) else []  # added: normalize documents to a list
+    d_or_doc = None  # added: holder for the d_or document entry
+    for doc in documents:  # added: scan passcard documents list
+        if not isinstance(doc, dict):  # added: skip non-object entries
+            continue  # added: move to next
+        doc_name = str(doc.get("Name") or "").strip().lower()  # added: normalize document Name field
+        if doc_name == "d_or":  # added: match d_or document
+            d_or_doc = doc  # added: store matching document
+            break  # added: stop searching after first match
+    d_or_file_name = (d_or_doc.get("FileName") or "").strip() if isinstance(d_or_doc, dict) else ""  # added: extract d_or FileName
+    d_or_object_key = resolve_passcard_document_object_key("d_or", d_or_file_name) if d_or_file_name else ""  # added: resolve d_or/{FileName} key if present
+    vehicle_payload = {  # added: single vehicle payload (each passcard ties to one vehicle)
+        "id": vehicle.get("_id", ""),  # added: vehicle id
+        "plate_number": vehicle.get("PlateNumber", ""),  # added: plate number
+        "model": vehicle.get("Model", ""),  # added: model
+        "color": vehicle.get("Color", ""),  # added: color
+        "year_model": vehicle.get("YearModel", ""),  # added: year model
+        "status": vehicle.get("Status", ""),  # added: vehicle status (ACTIVE/INACTIVE)
+        "wheel_type_description": wheel_obj.get("Description", ""),  # added: wheel type description
+        "file_name": vehicle_file_name,
+        "s3_key": vehicle_object_key,
+        "image_found": bool(vehicle_object_key),
+        "image_url": presign_get_object(vehicle_object_key, expires_seconds=300) if vehicle_object_key else "",
+        "image_proxy_path": f"vehicle/image/{quote(vehicle_file_name, safe='')}" if vehicle_file_name else "",
+        "d_or_file_name": d_or_file_name,  # added: passcard document file name for d_or
+        "d_or_s3_key": d_or_object_key,  # added: resolved S3 key for d_or document (d_or/{FileName})
+        "d_or_image_found": bool(d_or_object_key),  # added: indicate if d_or image exists in S3
+        "d_or_image_url": presign_get_object(d_or_object_key, expires_seconds=300) if d_or_object_key else "",  # added: presigned URL for d_or image
+        "d_or_image_proxy_path": f"passcard/document/d_or/{quote(d_or_file_name, safe='')}" if d_or_file_name else "",  # added: API proxy path for streaming d_or image
+    }  # added: end vehicle payload
+
+    now = datetime.now()  # added: scan timestamp (not persisted)
+    record_data = {  # added: scan metadata for UI
+        "passcard_id": passcard.get("_id", passcard_id),  # added: resolved passcard id
+        "type": scan_type,  # added: IN/OUT
+        "date": now.strftime("%Y-%m-%d"),  # added: scan date
+        "time": now.strftime("%H:%M:%S"),  # added: scan time
+    }  # added: end record
+
+    response_payload = {  # added: response expected by Flutter after scanning
+        "message": "Scan successful",  # added: success message
+        "record": record_data,  # added: scan metadata
+        "owner": owner_payload,  # added: owner details
+        "vehicle": vehicle_payload,  # changed: single vehicle tied to the passcard
+        "passcard_status": passcard_status,  # changed: normalized passcard status
+    }  # added: end response
+    return _to_json_safe(response_payload)  # changed: ensure JSON-safe types
+
+
+@router.get("/vehicle/image/{filename}")
+@limiter.limit(settings.rate_limit)
+async def get_vehicle_image(request: Request, filename: str):  # changed: include request for slowapi rate limiter
+    name = (filename or "").strip().lstrip("/")
+    if not name:
+        raise HTTPException(status_code=400, detail="filename is required")
+    key = resolve_vehicle_object_key(name)
+    if not key:
+        raise HTTPException(status_code=404, detail="Image not found")
+    client = get_s3_client()
+    try:
+        obj = client.get_object(Bucket=settings.bucket_name, Key=key)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Image not found")
+    body = obj.get("Body")
+    content_type = obj.get("ContentType") or "application/octet-stream"
+    if content_type == "application/octet-stream":
+        lower = key.lower()
+        if lower.endswith(".jpg") or lower.endswith(".jpeg"):
+            content_type = "image/jpeg"
+        elif lower.endswith(".png"):
+            content_type = "image/png"
+        elif lower.endswith(".webp"):
+            content_type = "image/webp"
+    return StreamingResponse(body, media_type=content_type)
+
+
+@router.get("/passcard/document/{doc_name}/{filename}")  # added: stream passcard document images from S3 (ex: d_or/{FileName})
+@limiter.limit(settings.rate_limit)  # added: keep consistent rate limiting
+async def get_passcard_document_image(request: Request, doc_name: str, filename: str):  # added: handler for passcard document image proxy
+    folder = (doc_name or "").strip().strip("/").lower()  # added: normalize folder name
+    if folder != "d_or":  # added: restrict to d_or for now (avoid arbitrary key reads)
+        raise HTTPException(status_code=404, detail="Image not found")  # added: hide unsupported document folders
+    name = (filename or "").strip().lstrip("/")  # added: normalize filename
+    if not name:  # added: validate required filename
+        raise HTTPException(status_code=400, detail="filename is required")  # added: consistent missing filename error
+    key = resolve_passcard_document_object_key(folder, name)  # added: resolve S3 key under d_or/
+    if not key:  # added: not found
+        raise HTTPException(status_code=404, detail="Image not found")  # added: consistent not found error
+    client = get_s3_client()  # added: reuse singleton S3 client
+    try:  # added: wrap S3 get_object
+        obj = client.get_object(Bucket=settings.bucket_name, Key=key)  # added: fetch image bytes
+    except Exception:  # added: map S3 errors to 404
+        raise HTTPException(status_code=404, detail="Image not found")  # added: consistent not found error
+    body = obj.get("Body")  # added: streaming body
+    content_type = obj.get("ContentType") or "application/octet-stream"  # added: content type fallback
+    if content_type == "application/octet-stream":  # added: infer basic image types when missing
+        lower = key.lower()  # added: case-insensitive suffix check
+        if lower.endswith(".jpg") or lower.endswith(".jpeg"):  # added: jpeg
+            content_type = "image/jpeg"  # added: set jpeg content type
+        elif lower.endswith(".png"):  # added: png
+            content_type = "image/png"  # added: set png content type
+        elif lower.endswith(".webp"):  # added: webp
+            content_type = "image/webp"  # added: set webp content type
+    return StreamingResponse(body, media_type=content_type)  # added: return streamed image response
 
 
 @router.get("/user/test-otp/{email}")

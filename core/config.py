@@ -5,6 +5,12 @@ class AppSettings(BaseSettings):
     app_name: str = "Development API"
     debug: bool = True
     rate_limit: str = "1/minute"
+    key: str = ""  # added: password pepper/key loaded from .env KEY for password verification
+    bucket_name: str = ""
+    region: str = ""
+    accesskey: str = ""
+    secretkey: str = ""
+    session_token: str = ""
     # MongoDB - read from .env (MONGODB_URI, MONGODB_DB)
     mongodb_uri: str = "mongodb://localhost:27017"
     mongodb_db: str = "afp"

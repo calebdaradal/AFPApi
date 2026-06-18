@@ -61,8 +61,8 @@ class CustomerCreateInput(BaseModel):
     image: str = Field(..., description="Customer image URL or base64 string")
 
 class RecordCreateInput(BaseModel):
-    customer_id: str = Field(..., description="MongoDB customer _id as string")
-    type: str = Field(..., description='Scan type: "IN" or "OUT"')
+    passcard_id: str = Field(..., description="MongoDB passcard _id (or SerialNumber) as string")  # changed: scan IDs now come from passcards collection
+    type: str = Field(..., description='Scan type: "IN" or "OUT"')  # unchanged: still IN/OUT
 
 class BaseResponse(BaseModel):
     message: str

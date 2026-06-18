@@ -4,6 +4,7 @@ from typing import Optional
 import pyotp
 
 from services.mongo_client import get_users_collection
+from services.user_service import find_user_by_email_value, get_user_email  # added: support new Mongo user schema fields (Email/Security)
 
 # TOTP secrets are stored on each user document as `totp_secret` (persisted; survives API restarts).
 
@@ -30,18 +31,11 @@ def canonical_email_for_user(raw_email: str) -> Optional[str]:
     raw = (raw_email or "").strip()
     if not raw:
         return None
-    users = get_users_collection()
-    user = users.find_one({"email": raw})
-    if user:
-        em = user.get("email")
-        return em.strip() if isinstance(em, str) else None
-    user = users.find_one(
-        {"email": {"$regex": f"^{re.escape(raw)}$", "$options": "i"}}
-    )
-    if not user:
-        return None
-    em = user.get("email")
-    return em.strip() if isinstance(em, str) else None
+    user = find_user_by_email_value(raw)  # changed: resolve user across both `email` (legacy) and `Email` (new) fields
+    if not user:  # added: user not found
+        return None  # added: no canonical email available
+    em = get_user_email(user)  # added: read email from the correct field name
+    return em if em else None  # changed: return normalized email (or None)
 
 
 def totp_provisioning_uri(
@@ -56,22 +50,24 @@ def get_totp_secret(raw_email: str) -> Optional[str]:
     canonical = canonical_email_for_user(raw_email)
     if not canonical:
         return None
-    users = get_users_collection()
-    user = users.find_one({"email": canonical})
-    if not user:
-        return None
+    user = find_user_by_email_value(canonical)  # changed: load user across both legacy/new schema fields
+    if not user:  # added: user not found
+        return None  # added: cannot read secret
     return _normalize_secret(user.get("totp_secret"))
 
 
 def generate_totp_secret(raw_email: str) -> str:
     """Create a new secret and save it (replaces any existing secret)."""
-    canonical = canonical_email_for_user(raw_email)
-    if not canonical:
+    canonical = canonical_email_for_user(raw_email)  # changed: canonical email may come from either `email` or `Email` field
+    if not canonical:  # unchanged: user not found
         raise ValueError("No user registered with this email")
-    users = get_users_collection()
-    secret = pyotp.random_base32()
-    users.update_one({"email": canonical}, {"$set": {"totp_secret": secret}})
-    return secret
+    users = get_users_collection()  # unchanged: load users collection
+    user = find_user_by_email_value(canonical)  # added: load user across both legacy/new schema fields
+    if not user:  # added: safety check
+        raise ValueError("No user registered with this email")  # added: consistent error when user missing
+    secret = pyotp.random_base32()  # unchanged: generate base32 secret
+    users.update_one({"_id": user["_id"]}, {"$set": {"totp_secret": secret}})  # changed: update by _id for schema compatibility
+    return secret  # unchanged: return generated secret
 
 
 def get_or_create_totp_secret(raw_email: str) -> str:
