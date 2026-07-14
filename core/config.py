@@ -16,6 +16,8 @@ class AppSettings(BaseSettings):
     mongodb_db: str = "afp"
     # QR decryption seed (must match the encryptor seed for AES-256-GCM key derivation)
     qr_encryption_key: str = "AFP_TEXT_ENCRYPTOR_STATIC_DEV_KEY_V1"
+    # Temp image request URL for non-migrated passcard documents (GET with fileName & passKey params)
+    temp_image_request: str = ""
 
     class Config:
         env_file = ".env"

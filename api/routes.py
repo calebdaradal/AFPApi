@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 import base64
 import binascii
 import hashlib
-from urllib.parse import quote
+import httpx  # added: HTTP client for temp image requests
+from urllib.parse import quote, urlencode
 from bson import ObjectId
 from bson.errors import InvalidId
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -44,6 +45,7 @@ from services.totp_service import (
     totp_provisioning_uri,
 )
 from services.s3_client import resolve_vehicle_object_key, resolve_passcard_document_object_key, presign_get_object, get_s3_client  # changed: add passcard document S3 resolver (d_or/{FileName})
+from services.encryption_service import encrypt_string  # added: AES-CBC encryption matching C# AesOperation
 from services.jwt_service import create_jwt_token, verify_jwt_token
 from core.config import AppSettings
 from core.rate_limit import limiter
@@ -590,33 +592,81 @@ async def create_record(
     }  # added: end owner payload
 
     wheel_obj = vehicle.get("WheelType") if isinstance(vehicle.get("WheelType"), dict) else {}  # added: safely read nested wheel type object
-    vehicle_file_name = (vehicle.get("FileName") or "").strip()
+    vehicle_file_name = (vehicle.get("FileName") or "").strip()  # changed: read vehicle's FileName from vehicles collection
     vehicle_object_key = resolve_vehicle_object_key(vehicle_file_name)
     raw_documents = passcard.get("Documents") if isinstance(passcard.get("Documents"), list) else passcard.get("documents")  # added: read passcard documents (supports Documents/documents casing)
     documents = raw_documents if isinstance(raw_documents, list) else []  # added: normalize documents to a list
-    d_owner_doc = None  # added: holder for the d_owner document entry
-    for doc in documents:  # added: scan passcard documents list
-        if not isinstance(doc, dict):  # added: skip non-object entries
-            continue  # added: move to next
-        doc_name = str(doc.get("Name") or "").strip().lower()  # added: normalize document Name field
-        if doc_name == "d_owner":  # changed: match d_owner document (new 2nd image)
-            d_owner_doc = doc  # changed: store matching document
-            break  # added: stop searching after first match
-    if d_owner_doc is None:  # added: fallback for older data that still uses d_or
-        for doc in documents:  # added: scan passcard documents list again
+
+    # Helper: find a document by name from the passcard's Documents array
+    def _find_doc(name: str) -> dict | None:  # added: helper to find a document by name
+        for doc in documents:  # added: scan documents list
             if not isinstance(doc, dict):  # added: skip non-object entries
                 continue  # added: move to next
-            doc_name = str(doc.get("Name") or "").strip().lower()  # added: normalize document Name field
-            if doc_name == "d_or":  # added: legacy fallback
-                d_owner_doc = doc  # added: reuse variable for legacy d_or
-                break  # added: stop searching after first match
-    d_owner_file_name = (d_owner_doc.get("FileName") or "").strip() if isinstance(d_owner_doc, dict) else ""  # changed: extract d_owner FileName
-    d_owner_folder = "d_owner"  # added: default folder name for second document image
-    if isinstance(d_owner_doc, dict):  # added: infer folder name from document entry when possible
-        name_field = str(d_owner_doc.get("Name") or "").strip().lower()  # added: normalize name field
-        if name_field in {"d_owner", "d_or"}:  # added: restrict to known folders
-            d_owner_folder = name_field  # added: use detected folder
-    d_owner_object_key = resolve_passcard_document_object_key(d_owner_folder, d_owner_file_name) if d_owner_file_name else ""  # changed: resolve {folder}/{FileName} key if present
+            if str(doc.get("Name") or "").strip().lower() == name:  # added: case-insensitive match
+                return doc  # added: return matching document
+        return None  # added: not found
+
+    # Helper: process a single document (fetch temp image or fall back to S3)
+    async def _process_doc(doc_name: str) -> dict:  # added: process a document with migrated/temp logic
+        doc = _find_doc(doc_name)  # added: find document by name
+        file_name = (doc.get("FileName") or "").strip() if isinstance(doc, dict) else ""  # added: extract FileName
+        is_migrated = bool(doc.get("Migrated", True)) if isinstance(doc, dict) else True  # added: read Migrated flag
+        temp_image_b64 = ""  # added: holder for temp image base64
+        if file_name and not is_migrated and settings.temp_image_request:  # added: only fetch when not migrated
+            try:  # added: wrap in try/except
+                now_for_passkey = datetime.now()  # added: current timestamp
+                passkey_plain = f"480|aspen9|{now_for_passkey.strftime('%m/%d/%Y')} {now_for_passkey.strftime('%H:%M:%S')}"  # added: format passKey
+                passkey_encrypted = encrypt_string(settings.key, passkey_plain)  # added: encrypt
+                params = urlencode({"fileName": file_name, "passKey": passkey_encrypted})  # added: URL-encode
+                url = f"{settings.temp_image_request}?{params}"  # added: full URL
+                async with httpx.AsyncClient() as client:  # added: async HTTP client
+                    resp = await client.get(url)  # added: make GET request
+                    resp.raise_for_status()  # added: raise on non-2xx
+                    temp_image_b64 = resp.text.strip()  # added: raw response
+                    if temp_image_b64.startswith("[") and "]" in temp_image_b64:  # added: strip [local]/[s3] prefix
+                        temp_image_b64 = temp_image_b64.split("]", 1)[1].strip()  # added: keep only base64
+            except Exception:  # added: catch any failure
+                temp_image_b64 = ""  # added: fall back to empty
+        object_key = resolve_passcard_document_object_key(doc_name, file_name) if file_name else ""  # added: resolve S3 key
+        if temp_image_b64:  # added: use temp proxy path
+            image_url = ""  # added: no direct URL
+            image_found = True  # added: image available
+            proxy_path = f"passcard/document/temp/{quote(file_name, safe='')}" if file_name else ""  # added: temp proxy
+        else:  # added: fall back to S3
+            image_url = presign_get_object(object_key, expires_seconds=300) if object_key else ""  # added: presigned URL
+            image_found = bool(object_key)  # added: image exists in S3
+            proxy_path = f"passcard/document/{quote(doc_name, safe='')}/{quote(file_name, safe='')}" if file_name else ""  # added: S3 proxy
+        return {  # added: return processed document data
+            "file_name": file_name,  # added: document file name
+            "folder": doc_name,  # added: document folder name
+            "s3_key": object_key,  # added: S3 object key
+            "image_found": image_found,  # added: whether image is available
+            "image_url": image_url,  # added: presigned URL or empty
+            "image_proxy_path": proxy_path,  # added: proxy path for Flutter
+        }  # added: end return
+
+    # Process all three documents
+    d_owner_data = await _process_doc("d_owner")  # added: process d_owner document
+    d_car_data = await _process_doc("d_car")  # added: process d_car document
+    d_or_data = await _process_doc("d_or")  # added: process d_or document
+
+    # Fallback: if vehicle's FileName is "not-migrated" or empty, use d_owner's FileName
+    vehicle_file_name_fell_back = False  # added: track whether fallback occurred
+    if not vehicle_file_name or vehicle_file_name == "not-migrated":  # added: check for placeholder/missing filename
+        vehicle_file_name = d_owner_data["file_name"]  # added: fallback to d_owner's FileName
+        vehicle_object_key = resolve_vehicle_object_key(vehicle_file_name)  # added: re-resolve key with fallback filename
+        vehicle_file_name_fell_back = True  # added: mark that fallback happened
+
+    # Vehicle image proxy path: use temp if fell back and d_owner has temp image, else S3
+    if vehicle_file_name and vehicle_file_name_fell_back and d_owner_data["image_found"] and d_owner_data["image_url"] == "":
+        vehicle_image_proxy_path = f"passcard/document/temp/{quote(vehicle_file_name, safe='')}"  # added: temp proxy
+    elif vehicle_file_name and vehicle_file_name_fell_back:
+        vehicle_image_proxy_path = f"passcard/document/d_owner/{quote(vehicle_file_name, safe='')}"  # added: S3 d_owner proxy
+    elif vehicle_file_name:
+        vehicle_image_proxy_path = f"vehicle/image/{quote(vehicle_file_name, safe='')}"  # added: vehicle S3 proxy
+    else:
+        vehicle_image_proxy_path = ""  # added: no filename
+
     vehicle_payload = {  # added: single vehicle payload (each passcard ties to one vehicle)
         "id": vehicle.get("_id", ""),  # added: vehicle id
         "plate_number": vehicle.get("PlateNumber", ""),  # added: plate number
@@ -629,13 +679,28 @@ async def create_record(
         "s3_key": vehicle_object_key,
         "image_found": bool(vehicle_object_key),
         "image_url": presign_get_object(vehicle_object_key, expires_seconds=300) if vehicle_object_key else "",
-        "image_proxy_path": f"vehicle/image/{quote(vehicle_file_name, safe='')}" if vehicle_file_name else "",
-        "d_owner_file_name": d_owner_file_name,  # changed: passcard document file name for d_owner
-        "d_owner_folder": d_owner_folder,  # added: folder name used for the second document image (d_owner or fallback d_or)
-        "d_owner_s3_key": d_owner_object_key,  # changed: resolved S3 key for d_owner document ({folder}/{FileName})
-        "d_owner_image_found": bool(d_owner_object_key),  # changed: indicate if d_owner image exists in S3
-        "d_owner_image_url": presign_get_object(d_owner_object_key, expires_seconds=300) if d_owner_object_key else "",  # changed: presigned URL for d_owner image
-        "d_owner_image_proxy_path": f"passcard/document/{quote(d_owner_folder, safe='')}/{quote(d_owner_file_name, safe='')}" if d_owner_file_name else "",  # changed: API proxy path for streaming d_owner image
+        "image_proxy_path": vehicle_image_proxy_path,
+        # d_owner document
+        "d_owner_file_name": d_owner_data["file_name"],
+        "d_owner_folder": d_owner_data["folder"],
+        "d_owner_s3_key": d_owner_data["s3_key"],
+        "d_owner_image_found": d_owner_data["image_found"],
+        "d_owner_image_url": d_owner_data["image_url"],
+        "d_owner_image_proxy_path": d_owner_data["image_proxy_path"],
+        # d_car document
+        "d_car_file_name": d_car_data["file_name"],
+        "d_car_folder": d_car_data["folder"],
+        "d_car_s3_key": d_car_data["s3_key"],
+        "d_car_image_found": d_car_data["image_found"],
+        "d_car_image_url": d_car_data["image_url"],
+        "d_car_image_proxy_path": d_car_data["image_proxy_path"],
+        # d_or document
+        "d_or_file_name": d_or_data["file_name"],
+        "d_or_folder": d_or_data["folder"],
+        "d_or_s3_key": d_or_data["s3_key"],
+        "d_or_image_found": d_or_data["image_found"],
+        "d_or_image_url": d_or_data["image_url"],
+        "d_or_image_proxy_path": d_or_data["image_proxy_path"],
     }  # added: end vehicle payload
 
     now = datetime.now()  # added: scan timestamp (not persisted)
@@ -661,6 +726,7 @@ async def create_record(
         "passcard": passcard_payload,  # added: passcard details for UI labels
         "passcard_status": passcard_status,  # changed: normalized passcard status
     }  # added: end response
+    print(f"[DEBUG] vehicle.image_proxy_path='{vehicle_payload.get('image_proxy_path')}' | d_owner.found={vehicle_payload.get('d_owner_image_found')} | d_car.found={vehicle_payload.get('d_car_image_found')} | d_or.found={vehicle_payload.get('d_or_image_found')}")
     return _to_json_safe(response_payload)  # changed: ensure JSON-safe types
 
 
@@ -691,22 +757,57 @@ async def get_vehicle_image(request: Request, filename: str):  # changed: includ
     return StreamingResponse(body, media_type=content_type)
 
 
+@router.get("/passcard/document/temp/{filename}")  # added: proxy endpoint for non-migrated temp images (MUST be before {doc_name} route)
+@limiter.limit(settings.rate_limit)  # added: consistent rate limiting
+async def get_temp_passcard_document_image(request: Request, filename: str):  # added: re-fetch from external TEMP_IMAGE_REQUEST and return raw bytes
+    name = (filename or "").strip().lstrip("/")  # added: normalize filename
+    if not name:  # added: validate required filename
+        raise HTTPException(status_code=400, detail="filename is required")  # added: consistent error
+    if not settings.temp_image_request:  # added: check if external endpoint is configured
+        raise HTTPException(status_code=404, detail="Image not found")  # added: no source configured
+    try:  # added: wrap external fetch in try/except
+        now_for_passkey = datetime.now()  # added: current timestamp for passKey
+        passkey_plain = f"480|aspen9|{now_for_passkey.strftime('%m/%d/%Y')} {now_for_passkey.strftime('%H:%M:%S')}"  # added: same format as scan endpoint
+        passkey_encrypted = encrypt_string(settings.key, passkey_plain)  # added: encrypt using same C#-compatible AES-CBC
+        params = urlencode({"fileName": name, "passKey": passkey_encrypted})  # added: URL-encode params
+        url = f"{settings.temp_image_request}?{params}"  # added: full request URL
+        print(f"[DEBUG TEMP] Fetching: {url}")
+        async with httpx.AsyncClient() as client:  # added: async HTTP client
+            resp = await client.get(url)  # added: make GET request
+            print(f"[DEBUG TEMP] status={resp.status_code}")
+            resp.raise_for_status()  # added: raise on non-2xx
+            raw_text = resp.text  # added: raw response text
+            print(f"[DEBUG TEMP] raw length={len(raw_text)} | first_50_chars='{raw_text[:50]}' | last_10_chars='{raw_text[-10:]}'")
+            image_b64 = raw_text.strip()  # added: raw base64 string from external endpoint
+            # Strip prefix like [local] or [s3] that the external endpoint prepends
+            if image_b64.startswith("[") and "]" in image_b64:
+                image_b64 = image_b64.split("]", 1)[1].strip()
+            image_bytes = base64.b64decode(image_b64)  # added: decode base64 to raw bytes
+            print(f"[DEBUG TEMP] decoded to {len(image_bytes)} bytes | first_4_hex={image_bytes[:4].hex()}")
+            return StreamingResponse(iter([image_bytes]), media_type="image/png")  # added: return raw image bytes
+    except Exception as e:  # added: catch any failure
+        print(f"[DEBUG TEMP] FAILED: {e}")
+        raise HTTPException(status_code=404, detail="Image not found")  # added: consistent 404 on failure
+
+
 @router.get("/passcard/document/{doc_name}/{filename}")  # changed: stream passcard document images from S3 (ex: d_owner/{FileName})
 @limiter.limit(settings.rate_limit)  # added: keep consistent rate limiting
 async def get_passcard_document_image(request: Request, doc_name: str, filename: str):  # added: handler for passcard document image proxy
     folder = (doc_name or "").strip().strip("/").lower()  # added: normalize folder name
-    if folder not in {"d_owner", "d_or"}:  # changed: restrict to known passcard document folders (avoid arbitrary key reads)
+    if folder not in {"d_owner", "d_or", "d_car"}:  # changed: allow d_car in addition to d_owner and d_or
         raise HTTPException(status_code=404, detail="Image not found")  # added: hide unsupported document folders
     name = (filename or "").strip().lstrip("/")  # added: normalize filename
     if not name:  # added: validate required filename
         raise HTTPException(status_code=400, detail="filename is required")  # added: consistent missing filename error
     key = resolve_passcard_document_object_key(folder, name)  # changed: resolve S3 key under allowed folder/
+    print(f"[DEBUG S3] doc_name='{folder}' filename='{name}' resolved_key='{key}' bucket='{settings.bucket_name}'")
     if not key:  # added: not found
         raise HTTPException(status_code=404, detail="Image not found")  # added: consistent not found error
     client = get_s3_client()  # added: reuse singleton S3 client
     try:  # added: wrap S3 get_object
         obj = client.get_object(Bucket=settings.bucket_name, Key=key)  # added: fetch image bytes
-    except Exception:  # added: map S3 errors to 404
+    except Exception as e:  # added: map S3 errors to 404
+        print(f"[DEBUG S3] get_object FAILED for key='{key}': {e}")
         raise HTTPException(status_code=404, detail="Image not found")  # added: consistent not found error
     body = obj.get("Body")  # added: streaming body
     content_type = obj.get("ContentType") or "application/octet-stream"  # added: content type fallback
